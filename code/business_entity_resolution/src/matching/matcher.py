@@ -1,6 +1,7 @@
 from pathlib import Path
 import warnings
 import joblib
+# pyrefly: ignore [missing-import]
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ from src.evaluation.metrics import (
 warnings.filterwarnings("ignore")
 
 try:
+  # pyrefly: ignore [missing-import]
   import xgboost as xgb
 
   HAS_XGB = True
@@ -22,6 +24,7 @@ except ImportError:
   HAS_XGB = False
 
 try:
+  # pyrefly: ignore [missing-import]
   from catboost import CatBoostClassifier
 
   HAS_CAT = True

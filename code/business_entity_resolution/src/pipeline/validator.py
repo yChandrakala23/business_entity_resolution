@@ -3,6 +3,12 @@
 Owned by Person 4. Runs cheap, focused checks *before* invoking the
 official utils/validate_submission.py script, so obvious mistakes are
 caught early instead of burning a leaderboard submission attempt.
+
+Vectorized rather than row-by-row: at the real dataset scale (2.2M
+Source 1 rows in train, similar in test) a per-row Python loop
+(.iterrows()) measurably crawls -- these checks explode the
+comma-joined ID lists once and validate with pandas/numpy set
+operations instead.
 """
 from __future__ import annotations
 
@@ -46,6 +52,18 @@ def _load_test_ids(test_dir: Path) -> Tuple[Set[str], Set[str], Set[str]]:
     return set(s1["entity_id"]), set(s2["entity_id"]), set(s3["entity_id"])
 
 
+def _explode_ids(df: pd.DataFrame, id_col: str, ids_col: str) -> pd.DataFrame:
+    """Vectorized (id_col, single_id) long-form table from a comma-joined
+    ids_col. A row with an empty ids_col contributes zero output rows.
+    """
+    working = df[[id_col, ids_col]].copy()
+    working["_id_list"] = working[ids_col].str.split(",")
+    exploded = working.explode("_id_list")
+    exploded["_id_list"] = exploded["_id_list"].fillna("").str.strip()
+    exploded = exploded[exploded["_id_list"] != ""]
+    return exploded[[id_col, "_id_list"]].rename(columns={"_id_list": "single_id"})
+
+
 def _validate_grouped_file(
     df: pd.DataFrame,
     id_col: str,
@@ -59,8 +77,9 @@ def _validate_grouped_file(
     if missing:
         raise ValidationError(f"{context} missing required columns: {sorted(missing)}")
 
-    if df[id_col].duplicated().any():
-        dupes = df.loc[df[id_col].duplicated(), id_col].tolist()
+    dup_row_mask = df[id_col].duplicated()
+    if dup_row_mask.any():
+        dupes = df.loc[dup_row_mask, id_col].tolist()
         raise ValidationError(f"{context}: duplicate {id_col} rows: {dupes[:10]}")
 
     seen = set(df[id_col])
@@ -77,24 +96,36 @@ def _validate_grouped_file(
             f"{sorted(extra_s1)[:5]}"
         )
 
-    for _, row in df.iterrows():
-        ids = _split_ids(row[ids_col])
+    exploded = _explode_ids(df, id_col, ids_col)
+    if exploded.empty:
+        return
 
-        if len(ids) != len(set(ids)):
-            raise ValidationError(f"{context}: duplicate IDs for {row[id_col]}: {ids}")
+    # Duplicate IDs within a single S1 entity's list.
+    dup_counts = exploded.groupby([id_col, "single_id"]).size()
+    dup_within = dup_counts[dup_counts > 1]
+    if not dup_within.empty:
+        offenders = dup_within.reset_index()[id_col].unique().tolist()
+        raise ValidationError(
+            f"{context}: duplicate IDs within a list for: {offenders[:10]}"
+        )
 
-        bad_prefix = [i for i in ids if not i.startswith(("S2-", "S3-"))]
-        if bad_prefix:
-            raise ValidationError(
-                f"{context}: non-S2-/S3- IDs for {row[id_col]}: {bad_prefix} "
-                "(no S1 IDs are allowed in output lists)"
-            )
+    valid_ids = exploded["single_id"]
 
-        unknown = [i for i in ids if i not in valid_s2_s3]
-        if unknown:
-            raise ValidationError(
-                f"{context}: IDs not present in test data for {row[id_col]}: {unknown}"
-            )
+    bad_prefix_mask = ~valid_ids.str.startswith(("S2-", "S3-"))
+    if bad_prefix_mask.any():
+        bad = exploded.loc[bad_prefix_mask, [id_col, "single_id"]].head(10)
+        raise ValidationError(
+            f"{context}: non-S2-/S3- IDs found (no S1 IDs allowed in output "
+            f"lists), e.g.: {list(bad.itertuples(index=False))}"
+        )
+
+    unknown_mask = ~valid_ids.isin(valid_s2_s3)
+    if unknown_mask.any():
+        bad = exploded.loc[unknown_mask, [id_col, "single_id"]].head(10)
+        raise ValidationError(
+            f"{context}: IDs not present in test data, e.g.: "
+            f"{list(bad.itertuples(index=False))}"
+        )
 
 
 def validate_candidate_pairs(candidate_pairs_path: Path, test_dir: Path) -> None:
@@ -122,23 +153,25 @@ def validate_match_subset(matching_results_path: Path, candidate_pairs_path: Pat
     matches = _read_tsv(matching_results_path)
     candidates = _read_tsv(candidate_pairs_path)
 
-    cand_map = {
-        row["source1_entity_id"]: set(_split_ids(row["candidate_entity_ids"]))
-        for _, row in candidates.iterrows()
-    }
+    match_pairs = _explode_ids(matches, "source1_entity_id", "matched_entity_ids")
+    cand_pairs = _explode_ids(candidates, "source1_entity_id", "candidate_entity_ids")
 
-    violations = {}
-    for _, row in matches.iterrows():
-        s1_id = row["source1_entity_id"]
-        matched_ids = set(_split_ids(row["matched_entity_ids"]))
-        not_in_candidates = matched_ids - cand_map.get(s1_id, set())
-        if not_in_candidates:
-            violations[s1_id] = sorted(not_in_candidates)
+    if match_pairs.empty:
+        logger.info("matching_results.tsv is a valid subset of candidate_pairs.tsv.")
+        return
 
-    if violations:
-        sample = dict(list(violations.items())[:5])
+    merged = match_pairs.merge(
+        cand_pairs.assign(_in_candidates=True),
+        on=["source1_entity_id", "single_id"],
+        how="left",
+    )
+    violations_df = merged[merged["_in_candidates"].isna()]
+
+    if not violations_df.empty:
+        grouped = violations_df.groupby("source1_entity_id")["single_id"].apply(list)
+        sample = dict(list(grouped.items())[:5])
         raise ValidationError(
-            f"{len(violations)} Source 1 entities have matches not present in their "
+            f"{grouped.shape[0]} Source 1 entities have matches not present in their "
             f"candidate set (matching_results.tsv must be a subset of "
             f"candidate_pairs.tsv). Examples: {sample}"
         )
@@ -163,16 +196,20 @@ def run_official_validator(
     matching_results_path: Path,
     candidate_pairs_path: Path,
     test_dir: Path,
+    check_ids: bool = False,
 ) -> None:
     """Invoke the official utils/validate_submission.py script.
+
+    check_ids mirrors the script's own --check-ids flag: off by default
+    (the script's docstring notes it costs a few GB on the full test
+    set), on to also verify every matched/candidate ID actually exists
+    in test_source2/3.tsv.
 
     Raises ValidationError if the script is missing or exits non-zero.
     """
     validator_script = Path(validator_script)
     if not validator_script.exists():
-        raise ValidationError(
-            f"Official validator not found at {validator_script}."
-        )
+        raise ValidationError(f"Official validator not found at {validator_script}.")
 
     cmd = [
         sys.executable,
@@ -181,6 +218,9 @@ def run_official_validator(
         "--candidate", str(candidate_pairs_path),
         "--test-dir", str(test_dir),
     ]
+    if check_ids:
+        cmd.append("--check-ids")
+
     logger.info("Running official validator: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
 

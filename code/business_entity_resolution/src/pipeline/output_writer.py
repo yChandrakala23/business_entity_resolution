@@ -118,6 +118,39 @@ def write_candidate_pairs(
     )
 
 
+def _split_ids(cell: str) -> List[str]:
+    cell = (cell or "").strip()
+    if not cell:
+        return []
+    return [c.strip() for c in cell.split(",") if c.strip()]
+
+
+def expand_grouped_ids(
+    df: pd.DataFrame,
+    id_col: str = "source1_entity_id",
+    ids_col: str = "matched_entity_ids",
+    value_col: str = "candidate_entity_id",
+) -> pd.DataFrame:
+    """Inverse of the grouping done by the writers above.
+
+    Some teammate outputs (e.g. Person 3's EntityMatcher.predict_test,
+    which already applies its own tuned threshold/margin and returns
+    one comma-joined row per Source 1 entity) arrive pre-grouped. This
+    expands that back into the long-form (id_col, value_col) pairs
+    that write_matching_results / write_candidate_pairs expect, so
+    TSV serialization stays centralized in this module rather than
+    being duplicated in run_pipeline.py.
+
+    A row with an empty ids_col contributes zero pairs (i.e. a
+    correctly-predicted singleton disappears, as it should).
+    """
+    records = []
+    for _, row in df.iterrows():
+        for value_id in _split_ids(row[ids_col]):
+            records.append({id_col: row[id_col], value_col: value_id})
+    return pd.DataFrame(records, columns=[id_col, value_col])
+
+
 def write_matching_results(
     source1: pd.DataFrame,
     predicted_matches: pd.DataFrame,
