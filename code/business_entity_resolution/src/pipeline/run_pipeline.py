@@ -126,17 +126,126 @@ def build_features(
 ) -> pd.DataFrame:
     """PERSON 2 CONTRACT -- feature engineering.
 
-    Expected return: `candidates` with engineered numeric similarity
-    columns appended (e.g. name_jaccard, addr_tfidf), preserving
-    'source1_entity_id' and 'candidate_entity_id'. Raw text columns
-    (business_name, business_address, country, ...) may also be
-    included -- EntityMatcher auto-selects numeric feature columns
-    and ignores known non-feature columns, so no fixed feature-name
-    list is required here.
+    NOTE: Person 2's real feature module hasn't landed yet. This is a
+    genuine (not placeholder/dummy) implementation built to unblock
+    Person 3's already-complete EntityMatcher for real end-to-end
+    testing -- swap it for her version once it lands; the contract
+    (numeric columns appended, ID columns preserved) is unchanged
+    either way, so nothing downstream needs to change when that swap
+    happens.
+
+    Reuses Person 1's src/blocking/normalize.py rather than
+    re-normalizing (same canonical tokens, pincode extraction,
+    transliteration handling she already built and tested).
+
+    Vectorized in the same style as her score_and_cap: pre-extract
+    lookup dicts, then a single plain-Python loop over id lists (not
+    DataFrame.apply) -- avoids per-row Series-construction overhead,
+    which matters at this dataset's real scale (up to ~100 candidates
+    x 2.2M Source 1 entities).
+
+    Appends (all numeric, in addition to the 'score'/'signal'
+    blocking-stage columns already on `candidates`):
+      name_token_sort_ratio, name_partial_ratio, name_jaro_winkler,
+      name_jaccard, addr_jaccard, pincode_match, name_soundex_match
     """
-    raise NotImplementedError(
-        "Feature engineering implementation from Person 2 has not been integrated yet."
-    )
+    from rapidfuzz import fuzz
+    from rapidfuzz.distance import JaroWinkler
+
+    from src.blocking.normalize import normalize_address, normalize_name
+
+    def _soundex(token: str) -> str:
+        """Minimal pure-Python Soundex (no extra dependency). Used only
+        as a coarse phonetic-collision signal, not a standalone match."""
+        if not token:
+            return ""
+        token = token.upper()
+        codes = {
+            **{c: "1" for c in "BFPV"}, **{c: "2" for c in "CGJKQSXZ"},
+            **{c: "3" for c in "DT"}, "L": "4", **{c: "5" for c in "MN"}, "R": "6",
+        }
+        first = token[0]
+        tail = "".join(codes.get(c, "0") for c in token[1:])
+        deduped = []
+        prev = codes.get(first, "0")
+        for c in tail:
+            if c != prev and c != "0":
+                deduped.append(c)
+            prev = c
+        return (first + "".join(deduped) + "000")[:4]
+
+    def _precompute(df: pd.DataFrame) -> pd.DataFrame:
+        name_info = df["business_name"].apply(normalize_name)
+        addr_info = df["business_address"].apply(normalize_address)
+        out = pd.DataFrame({"entity_id": df["entity_id"].values})
+        out["name_canonical"] = [d["canonical"] for d in name_info]
+        out["name_tokens"] = [d["tokens"] for d in name_info]
+        out["name_soundex"] = [_soundex(d["first_token"]) for d in name_info]
+        out["addr_tokens"] = [d["tokens"] for d in addr_info]
+        out["pincode"] = [d["pincode"] for d in addr_info]
+        return out.set_index("entity_id")
+
+    s1_norm = _precompute(source1)
+    cand_src = pd.concat([source2, source3], ignore_index=True).drop_duplicates("entity_id")
+    cand_norm = _precompute(cand_src)
+
+    s1_name = s1_norm["name_canonical"].to_dict()
+    cand_name = cand_norm["name_canonical"].to_dict()
+    s1_tok = s1_norm["name_tokens"].to_dict()
+    cand_tok = cand_norm["name_tokens"].to_dict()
+    s1_sdx = s1_norm["name_soundex"].to_dict()
+    cand_sdx = cand_norm["name_soundex"].to_dict()
+    s1_atok = s1_norm["addr_tokens"].to_dict()
+    cand_atok = cand_norm["addr_tokens"].to_dict()
+    s1_pin = s1_norm["pincode"].to_dict()
+    cand_pin = cand_norm["pincode"].to_dict()
+
+    s1_ids = candidates["source1_entity_id"].tolist()
+    cand_ids = candidates["candidate_entity_id"].tolist()
+    n = len(s1_ids)
+
+    name_token_sort = [0.0] * n
+    name_partial = [0.0] * n
+    name_jaro = [0.0] * n
+    name_jaccard = [0.0] * n
+    addr_jaccard = [0.0] * n
+    pincode_match = [0] * n
+    soundex_match = [0] * n
+
+    for i in range(n):
+        sid, cid = s1_ids[i], cand_ids[i]
+
+        n1, n2 = s1_name.get(sid, ""), cand_name.get(cid, "")
+        if n1 and n2:
+            name_token_sort[i] = fuzz.token_sort_ratio(n1, n2) / 100.0
+            name_partial[i] = fuzz.partial_ratio(n1, n2) / 100.0
+            name_jaro[i] = JaroWinkler.normalized_similarity(n1, n2)
+
+        t1 = s1_tok.get(sid) or frozenset()
+        t2 = cand_tok.get(cid) or frozenset()
+        if t1 and t2:
+            name_jaccard[i] = len(t1 & t2) / max(1, len(t1 | t2))
+
+        a1 = s1_atok.get(sid) or frozenset()
+        a2 = cand_atok.get(cid) or frozenset()
+        if a1 and a2:
+            addr_jaccard[i] = len(a1 & a2) / max(1, len(a1 | a2))
+
+        p1, p2 = s1_pin.get(sid, ""), cand_pin.get(cid, "")
+        pincode_match[i] = 1 if (p1 and p2 and p1 == p2) else 0
+
+        sx1, sx2 = s1_sdx.get(sid, ""), cand_sdx.get(cid, "")
+        soundex_match[i] = 1 if (sx1 and sx2 and sx1 == sx2) else 0
+
+    result = candidates.copy()
+    result["name_token_sort_ratio"] = name_token_sort
+    result["name_partial_ratio"] = name_partial
+    result["name_jaro_winkler"] = name_jaro
+    result["name_jaccard"] = name_jaccard
+    result["addr_jaccard"] = addr_jaccard
+    result["pincode_match"] = pincode_match
+    result["name_soundex_match"] = soundex_match
+    return result
 
 
 # ---------------------------------------------------------------------------
