@@ -116,7 +116,7 @@ def _unpack_addr(normalized) -> tuple[str, list[str], str | None]:
     """-> (canonical_string, token_list, pincode_or_None)"""
     if isinstance(normalized, dict):
         return (
-            normalized.get("canonical", ""),
+            normalized.get("canonical") or normalized.get("normalized", ""),
             normalized.get("tokens", []),
             normalized.get("pincode"),
         )
@@ -334,10 +334,10 @@ def build_features(
     for col in ["name_canonical", "addr_canonical", "pincode"]:
         out[f"s1_{col}"] = out.get(f"s1_{col}", pd.Series(dtype=object)).fillna("")
         out[f"cand_{col}"] = out.get(f"cand_{col}", pd.Series(dtype=object)).fillna("")
-    out["s1_name_tokens"] = out["s1_name_tokens"].apply(lambda v: v if isinstance(v, list) else [])
-    out["cand_name_tokens"] = out["cand_name_tokens"].apply(lambda v: v if isinstance(v, list) else [])
-    out["s1_addr_tokens"] = out["s1_addr_tokens"].apply(lambda v: v if isinstance(v, list) else [])
-    out["cand_addr_tokens"] = out["cand_addr_tokens"].apply(lambda v: v if isinstance(v, list) else [])
+    out["s1_name_tokens"] = out["s1_name_tokens"].apply(lambda v: v if isinstance(v, (list, set, frozenset, tuple)) else [])
+    out["cand_name_tokens"] = out["cand_name_tokens"].apply(lambda v: v if isinstance(v, (list, set, frozenset, tuple)) else [])
+    out["s1_addr_tokens"] = out["s1_addr_tokens"].apply(lambda v: v if isinstance(v, (list, set, frozenset, tuple)) else [])
+    out["cand_addr_tokens"] = out["cand_addr_tokens"].apply(lambda v: v if isinstance(v, (list, set, frozenset, tuple)) else [])
 
     # --- vectorized pairwise features ---
     name_jaccard, name_overlap = _sparse_jaccard_and_overlap(out["s1_name_tokens"], out["cand_name_tokens"])

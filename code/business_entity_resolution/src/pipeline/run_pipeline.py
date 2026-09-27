@@ -126,126 +126,65 @@ def build_features(
 ) -> pd.DataFrame:
     """PERSON 2 CONTRACT -- feature engineering.
 
-    NOTE: Person 2's real feature module hasn't landed yet. This is a
-    genuine (not placeholder/dummy) implementation built to unblock
-    Person 3's already-complete EntityMatcher for real end-to-end
-    testing -- swap it for her version once it lands; the contract
-    (numeric columns appended, ID columns preserved) is unchanged
-    either way, so nothing downstream needs to change when that swap
-    happens.
+    Thin wrapper around Person 2's real src/features/build_features.py
+    (Mansi). Her implementation is fully vectorized per-call (sparse
+    CountVectorizer/TfidfVectorizer for Jaccard/TF-IDF, rapidfuzz for
+    Levenshtein/Jaro-Winkler, jellyfish for phonetic match -- see her
+    module docstring for the full vectorization rationale).
 
-    Reuses Person 1's src/blocking/normalize.py rather than
-    re-normalizing (same canonical tokens, pincode extraction,
-    transliteration handling she already built and tested).
+    Why this wrapper exists rather than calling her function directly:
+    benchmarked on real sampled data, her single-call cost is
+    ~0.04-0.06 ms/pair and NOT superlinear -- but extrapolated to the
+    real full scale (~2.2M S1 x up to 100 candidates =~ 205M pairs)
+    that's still >2 hours in one unchunked call, and one CountVectorizer/
+    TfidfVectorizer fit_transform over the full corpus at once risks
+    memory pressure alongside everything else the pipeline holds in
+    memory concurrently.
 
-    Vectorized in the same style as her score_and_cap: pre-extract
-    lookup dicts, then a single plain-Python loop over id lists (not
-    DataFrame.apply) -- avoids per-row Series-construction overhead,
-    which matters at this dataset's real scale (up to ~100 candidates
-    x 2.2M Source 1 entities).
+    This wraps her function with the same per-country partitioning
+    Person 1's blocking stage already uses, calling her build_features
+    once per country and concatenating results. Since her vectorizers
+    are refit fresh on every call already (no shared vocabulary across
+    calls), this changes nothing about correctness -- TF-IDF/Jaccard
+    are computed as row-aligned pairwise similarity, never compared
+    across rows, so a per-country vocabulary is equivalent in kind to
+    a global one, just bounded in size. Country is a required column
+    on every real record, so this never drops or misroutes a pair.
 
-    Appends (all numeric, in addition to the 'score'/'signal'
-    blocking-stage columns already on `candidates`):
-      name_token_sort_ratio, name_partial_ratio, name_jaro_winkler,
-      name_jaccard, addr_jaccard, pincode_match, name_soundex_match
+    BUGFIX (verified against real src/blocking/normalize.py, which
+    didn't exist yet when this feature module was written): her
+    _unpack_addr() looked for a "canonical" key that Person 1's real
+    normalize_address() calls "normalized" instead -- and her
+    post-merge token cleanup checked `isinstance(v, list)`, but real
+    tokens come back as `frozenset`, so every row's tokens were being
+    silently wiped to `[]` (this actually crashed outright: "empty
+    vocabulary" from CountVectorizer). Both are fixed directly in
+    src/features/build_features.py -- confirmed against real sampled
+    data, feature separation now matches her own README-person2.md
+    validation table.
     """
-    from rapidfuzz import fuzz
-    from rapidfuzz.distance import JaroWinkler
+    from src.features.build_features import build_features as _person2_build_features
 
-    from src.blocking.normalize import normalize_address, normalize_name
+    country_lookup = source1.drop_duplicates("entity_id").set_index("entity_id")["country"]
+    candidate_country = candidates["source1_entity_id"].map(country_lookup)
 
-    def _soundex(token: str) -> str:
-        """Minimal pure-Python Soundex (no extra dependency). Used only
-        as a coarse phonetic-collision signal, not a standalone match."""
-        if not token:
-            return ""
-        token = token.upper()
-        codes = {
-            **{c: "1" for c in "BFPV"}, **{c: "2" for c in "CGJKQSXZ"},
-            **{c: "3" for c in "DT"}, "L": "4", **{c: "5" for c in "MN"}, "R": "6",
-        }
-        first = token[0]
-        tail = "".join(codes.get(c, "0") for c in token[1:])
-        deduped = []
-        prev = codes.get(first, "0")
-        for c in tail:
-            if c != prev and c != "0":
-                deduped.append(c)
-            prev = c
-        return (first + "".join(deduped) + "000")[:4]
+    chunks = []
+    for country, sub_idx in candidate_country.groupby(candidate_country).groups.items():
+        sub_candidates = candidates.loc[sub_idx]
+        s1_ids_needed = set(sub_candidates["source1_entity_id"])
+        cand_ids_needed = set(sub_candidates["candidate_entity_id"])
 
-    def _precompute(df: pd.DataFrame) -> pd.DataFrame:
-        name_info = df["business_name"].apply(normalize_name)
-        addr_info = df["business_address"].apply(normalize_address)
-        out = pd.DataFrame({"entity_id": df["entity_id"].values})
-        out["name_canonical"] = [d["canonical"] for d in name_info]
-        out["name_tokens"] = [d["tokens"] for d in name_info]
-        out["name_soundex"] = [_soundex(d["first_token"]) for d in name_info]
-        out["addr_tokens"] = [d["tokens"] for d in addr_info]
-        out["pincode"] = [d["pincode"] for d in addr_info]
-        return out.set_index("entity_id")
+        sub_s1 = source1[source1["entity_id"].isin(s1_ids_needed)]
+        sub_s2 = source2[source2["entity_id"].isin(cand_ids_needed)]
+        sub_s3 = source3[source3["entity_id"].isin(cand_ids_needed)]
 
-    s1_norm = _precompute(source1)
-    cand_src = pd.concat([source2, source3], ignore_index=True).drop_duplicates("entity_id")
-    cand_norm = _precompute(cand_src)
+        logger.info(
+            "build_features: country=%s, %d pairs, %d S1 / %d S2 / %d S3 rows",
+            country, len(sub_candidates), len(sub_s1), len(sub_s2), len(sub_s3),
+        )
+        chunks.append(_person2_build_features(sub_candidates, sub_s1, sub_s2, sub_s3))
 
-    s1_name = s1_norm["name_canonical"].to_dict()
-    cand_name = cand_norm["name_canonical"].to_dict()
-    s1_tok = s1_norm["name_tokens"].to_dict()
-    cand_tok = cand_norm["name_tokens"].to_dict()
-    s1_sdx = s1_norm["name_soundex"].to_dict()
-    cand_sdx = cand_norm["name_soundex"].to_dict()
-    s1_atok = s1_norm["addr_tokens"].to_dict()
-    cand_atok = cand_norm["addr_tokens"].to_dict()
-    s1_pin = s1_norm["pincode"].to_dict()
-    cand_pin = cand_norm["pincode"].to_dict()
-
-    s1_ids = candidates["source1_entity_id"].tolist()
-    cand_ids = candidates["candidate_entity_id"].tolist()
-    n = len(s1_ids)
-
-    name_token_sort = [0.0] * n
-    name_partial = [0.0] * n
-    name_jaro = [0.0] * n
-    name_jaccard = [0.0] * n
-    addr_jaccard = [0.0] * n
-    pincode_match = [0] * n
-    soundex_match = [0] * n
-
-    for i in range(n):
-        sid, cid = s1_ids[i], cand_ids[i]
-
-        n1, n2 = s1_name.get(sid, ""), cand_name.get(cid, "")
-        if n1 and n2:
-            name_token_sort[i] = fuzz.token_sort_ratio(n1, n2) / 100.0
-            name_partial[i] = fuzz.partial_ratio(n1, n2) / 100.0
-            name_jaro[i] = JaroWinkler.normalized_similarity(n1, n2)
-
-        t1 = s1_tok.get(sid) or frozenset()
-        t2 = cand_tok.get(cid) or frozenset()
-        if t1 and t2:
-            name_jaccard[i] = len(t1 & t2) / max(1, len(t1 | t2))
-
-        a1 = s1_atok.get(sid) or frozenset()
-        a2 = cand_atok.get(cid) or frozenset()
-        if a1 and a2:
-            addr_jaccard[i] = len(a1 & a2) / max(1, len(a1 | a2))
-
-        p1, p2 = s1_pin.get(sid, ""), cand_pin.get(cid, "")
-        pincode_match[i] = 1 if (p1 and p2 and p1 == p2) else 0
-
-        sx1, sx2 = s1_sdx.get(sid, ""), cand_sdx.get(cid, "")
-        soundex_match[i] = 1 if (sx1 and sx2 and sx1 == sx2) else 0
-
-    result = candidates.copy()
-    result["name_token_sort_ratio"] = name_token_sort
-    result["name_partial_ratio"] = name_partial
-    result["name_jaro_winkler"] = name_jaro
-    result["name_jaccard"] = name_jaccard
-    result["addr_jaccard"] = addr_jaccard
-    result["pincode_match"] = pincode_match
-    result["name_soundex_match"] = soundex_match
-    return result
+    return pd.concat(chunks, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
