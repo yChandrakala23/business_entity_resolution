@@ -9,12 +9,14 @@ artifact that run_pipeline.py loads.
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 
 import pandas as pd
 
 from src.matching.matcher import EntityMatcher
 from src.pipeline.config import PipelineConfig
+from src.pipeline.experiment_tracker import log_experiment
 from src.pipeline.run_pipeline import (
     build_features,
     generate_candidates,
@@ -24,6 +26,22 @@ from src.pipeline.run_pipeline import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _git_short_hash() -> str:
+    """Current commit hash (8 chars), so every logged experiment is
+    traceable to the exact code that produced it. Falls back to
+    "unversioned" outside a git checkout rather than failing."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short=8", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unversioned"
 
 
 def run_training(config: PipelineConfig) -> dict:
@@ -45,7 +63,7 @@ def run_training(config: PipelineConfig) -> dict:
     ground_truth_path = config.train_dir / "train_ground_truth.tsv"
     if not ground_truth_path.exists():
         raise FileNotFoundError(f"Training ground truth not found: {ground_truth_path}")
-    ground_truth = pd.read_csv(ground_truth_path, sep="\t")
+    ground_truth = pd.read_csv(ground_truth_path, sep="\t", dtype=str, keep_default_na=False)
     _check_columns(
         ground_truth,
         {"source1_entity_id", "matched_entity_ids"},
@@ -78,5 +96,20 @@ def run_training(config: PipelineConfig) -> dict:
         results["abs_threshold"],
         results["rel_margin"],
     )
+
+    commit = _git_short_hash()
+    experiment_id = log_experiment(
+        log_path=config.output_dir / "experiments" / "experiments.csv",
+        blocking_version=commit,
+        feature_version=commit,
+        model_version=commit,
+        threshold=results["abs_threshold"],
+        rel_margin=results["rel_margin"],
+        macro_f05=results["macro_f05"],
+        singleton_acc=results.get("singleton_acc"),
+        non_singleton_f05=results.get("non_singleton_f05"),
+        notes=f"n_train_s1={len(all_train_s1_ids)}",
+    )
+    logger.info("Logged as experiment %s", experiment_id)
 
     return results

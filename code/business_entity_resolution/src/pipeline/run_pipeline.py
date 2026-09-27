@@ -42,15 +42,24 @@ logger = logging.getLogger(__name__)
 def load_sources(data_dir: Path, split: str) -> Dict[str, pd.DataFrame]:
     """Load the three source TSVs for a given split ("train" or "test").
 
+    dtype=str + keep_default_na=False is deliberate, not a default: a
+    missing business_address (real data has these -- README notes
+    "missing components") otherwise parses as NaN (a float), which
+    crashes normalize_address's raw.strip() downstream. Every entity_id/
+    business_name/business_address/country field should stay a literal
+    string regardless of content.
+
     NOTE: If Person 1 builds a dedicated `load_train_data` /
-    `load_test_data` function with extra logic (e.g. dtype coercion),
-    swap it in here rather than duplicating loading logic elsewhere.
+    `load_test_data` function with extra logic, swap it in here rather
+    than duplicating loading logic elsewhere -- keep the same dtype
+    safety this function has.
     """
     data_dir = Path(data_dir)
+    read = lambda name: pd.read_csv(data_dir / name, sep="\t", dtype=str, keep_default_na=False)
     return {
-        "source1": pd.read_csv(data_dir / f"{split}_source1.tsv", sep="\t"),
-        "source2": pd.read_csv(data_dir / f"{split}_source2.tsv", sep="\t"),
-        "source3": pd.read_csv(data_dir / f"{split}_source3.tsv", sep="\t"),
+        "source1": read(f"{split}_source1.tsv"),
+        "source2": read(f"{split}_source2.tsv"),
+        "source3": read(f"{split}_source3.tsv"),
     }
 
 
@@ -94,6 +103,13 @@ def generate_candidates(
     right before her grouping step, so write_candidate_pairs (the single
     place TSV serialization happens) does the grouping/writing instead.
 
+    Partitioned by country before calling her functions, same as her
+    own standalone CLI's --country flag already recommends ("process
+    only this country ... bounds memory/runtime losslessly" -- matches
+    never cross countries, so this changes nothing about correctness,
+    only memory footprint per call). Consistent with how build_features
+    is chunked below.
+
     Returns long-form dataframe with columns
     ['source1_entity_id', 'candidate_entity_id', 'signal', 'score'].
     The extra 'signal'/'score' columns are harmless passengers for the
@@ -104,18 +120,30 @@ def generate_candidates(
     """
     bc = _import_blocking_module()
 
-    s1 = bc.add_normalized_columns(source1.copy(), "S1")
-    s2 = bc.add_normalized_columns(source2.copy(), "S2")
-    s3 = bc.add_normalized_columns(source3.copy(), "S3")
+    chunks = []
+    for country in sorted(source1["country"].unique()):
+        sub_s1 = source1[source1["country"] == country]
+        sub_s2 = source2[source2["country"] == country]
+        sub_s3 = source3[source3["country"] == country]
 
-    cand2 = bc.generate_candidates_for_source(s1, s2, "S2")
-    cand3 = bc.generate_candidates_for_source(s1, s3, "S3")
-    all_cand = pd.concat([cand2, cand3], ignore_index=True)
+        logger.info(
+            "generate_candidates: country=%s, %d S1 / %d S2 / %d S3 rows",
+            country, len(sub_s1), len(sub_s2), len(sub_s3),
+        )
 
-    cand_src_combined = pd.concat([s2, s3], ignore_index=True)
-    scored = bc.score_and_cap(all_cand, s1, cand_src_combined)
+        s1 = bc.add_normalized_columns(sub_s1.copy(), f"S1[{country}]")
+        s2 = bc.add_normalized_columns(sub_s2.copy(), f"S2[{country}]")
+        s3 = bc.add_normalized_columns(sub_s3.copy(), f"S3[{country}]")
 
-    return scored[["source1_entity_id", "candidate_entity_id", "signal", "score"]]
+        cand2 = bc.generate_candidates_for_source(s1, s2, f"S2[{country}]")
+        cand3 = bc.generate_candidates_for_source(s1, s3, f"S3[{country}]")
+        all_cand = pd.concat([cand2, cand3], ignore_index=True)
+
+        cand_src_combined = pd.concat([s2, s3], ignore_index=True)
+        scored = bc.score_and_cap(all_cand, s1, cand_src_combined)
+        chunks.append(scored[["source1_entity_id", "candidate_entity_id", "signal", "score"]])
+
+    return pd.concat(chunks, ignore_index=True)
 
 
 def build_features(

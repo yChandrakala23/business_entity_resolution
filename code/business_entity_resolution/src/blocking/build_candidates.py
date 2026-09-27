@@ -96,6 +96,46 @@ def build_token_index_filtered(df: pd.DataFrame, id_col: str, token_col: str = "
     return kept.drop(columns="freq")
 
 
+def _filter_overrepresented_keys(
+    s1_df: pd.DataFrame, cand_df: pd.DataFrame, key_cols: list, max_count: int = MAX_TOKEN_BLOCK
+) -> tuple:
+    """Drop (key) groups that are too common to join on safely.
+
+    Same discipline build_token_index_filtered() already applies to the
+    name_token/addr_token signals (a key this common isn't
+    discriminative anyway) -- extended here to the single-value-key
+    signals (name_prefix, name_char_prefix, name_concat_key), which
+    previously merged on raw keys with no frequency cap at all. At real
+    scale (millions of rows per source) a single very common key value
+    -- a generic 2-token combo, a common 3-char prefix -- produces a
+    join whose row count is the PRODUCT of that key's count on each
+    side, which is how this blew up to hundreds of millions of rows
+    (or an outright OOM allocating gigabytes for the join indexer) in
+    production. Bounding both sides at max_count bounds the worst-case
+    single-key contribution to max_count^2 rows, matching the existing
+    token-signal cap exactly.
+    """
+    s1_counts = s1_df.groupby(key_cols).size()
+    cand_counts = cand_df.groupby(key_cols).size()
+
+    s1_safe_keys = s1_counts[s1_counts <= max_count].index
+    cand_safe_keys = cand_counts[cand_counts <= max_count].index
+    safe_keys = s1_safe_keys.intersection(cand_safe_keys)
+
+    if len(key_cols) == 1:
+        s1_idx = s1_df.set_index(key_cols[0]).index
+        cand_idx = cand_df.set_index(key_cols[0]).index
+        s1_filtered = s1_df[s1_idx.isin(safe_keys)]
+        cand_filtered = cand_df[cand_idx.isin(safe_keys)]
+    else:
+        s1_idx = pd.MultiIndex.from_frame(s1_df[key_cols])
+        cand_idx = pd.MultiIndex.from_frame(cand_df[key_cols])
+        s1_filtered = s1_df[s1_idx.isin(safe_keys)]
+        cand_filtered = cand_df[cand_idx.isin(safe_keys)]
+
+    return s1_filtered, cand_filtered
+
+
 def generate_candidates_for_source(s1: pd.DataFrame, s2_or_3: pd.DataFrame, src_tag: str) -> pd.DataFrame:
     """
     Returns long DataFrame: [source1_entity_id, candidate_entity_id, signal]
@@ -107,6 +147,7 @@ def generate_candidates_for_source(s1: pd.DataFrame, s2_or_3: pd.DataFrame, src_
     # --- Signal 1: name prefix (country + first 2 sorted tokens) ---
     s1_key = s1[s1["name_prefix_key"] != ""][["entity_id", "country", "name_prefix_key"]]
     s2_key = s2_or_3[s2_or_3["name_prefix_key"] != ""][["entity_id", "country", "name_prefix_key"]]
+    s1_key, s2_key = _filter_overrepresented_keys(s1_key, s2_key, ["country", "name_prefix_key"])
     m = s1_key.merge(s2_key, on=["country", "name_prefix_key"], suffixes=("_s1", "_cand"))
     if len(m):
         out = m[["entity_id_s1", "entity_id_cand"]].copy()
@@ -129,6 +170,8 @@ def generate_candidates_for_source(s1: pd.DataFrame, s2_or_3: pd.DataFrame, src_
         "country",
         "name_char_prefix"
     ]]
+
+    s1_char, s2_char = _filter_overrepresented_keys(s1_char, s2_char, ["country", "name_char_prefix"])
 
     m_char = s1_char.merge(
         s2_char,
@@ -197,6 +240,7 @@ def generate_candidates_for_source(s1: pd.DataFrame, s2_or_3: pd.DataFrame, src_
     # --- Signal 5: concatenated no-space name (domain-style variants) ---
     s1_ck = s1[s1["name_concat_key"] != ""][["entity_id", "country", "name_concat_key"]]
     s2_ck = s2_or_3[s2_or_3["name_concat_key"] != ""][["entity_id", "country", "name_concat_key"]]
+    s1_ck, s2_ck = _filter_overrepresented_keys(s1_ck, s2_ck, ["country", "name_concat_key"])
     m5 = s1_ck.merge(s2_ck, on=["country", "name_concat_key"], suffixes=("_s1", "_cand"))
     if len(m5):
         out5 = m5[["entity_id_s1", "entity_id_cand"]].copy()
